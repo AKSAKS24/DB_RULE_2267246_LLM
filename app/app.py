@@ -1,24 +1,22 @@
-# app_2267246_strict.py
 from fastapi import FastAPI, HTTPException
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field
 from typing import List, Dict, Any, Optional
 import os, re, json
+import asyncio
 
-# ---- LLM Setup ----
 os.environ["LANGCHAIN_TRACING_V2"] = "true"
 os.environ["LANGCHAIN_API_KEY"] = os.getenv("LANGCHAIN_API_KEY")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 if not OPENAI_API_KEY:
-    raise RuntimeError("OPENAI_API_KEY environment variable is required.")
-OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o")
+    raise RuntimeError("Need OPENAI_API_KEY")
+OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4.1-nano")
 
 from langchain_openai import ChatOpenAI
 from langchain.prompts import ChatPromptTemplate
 from langchain_core.output_parsers import JsonOutputParser
 
-app = FastAPI(title="SAP Note 2267246 Obsolete Field Assessment - Strict Schema")
+app = FastAPI(title="SAP Note 2267246 ABAP Snippet Assessment")
 
-# ===== Obsolete fields =====
 OBSOLETE_FIELDS = [
     "MARC-MEGRU", "MARC-USEQU", "MARC-ALTSL", "MARC-MDACH",
     "MARC-DPLFS", "MARC-DPLPU", "MARC-DPLHO",
@@ -27,7 +25,6 @@ OBSOLETE_FIELDS = [
 ]
 OBSOLETE_DATAELEMS = sorted({f.split("-")[1] for f in OBSOLETE_FIELDS})
 
-# ===== Regex patterns =====
 SQL_FIELD_RE = re.compile(
     r"\b(" + "|".join([f.replace("-", r"[\-~>]") for f in OBSOLETE_FIELDS]) + r")\b",
     re.IGNORECASE
@@ -42,183 +39,160 @@ STRUCT_FIELD_RE = re.compile(
     re.IGNORECASE
 )
 
-# ===== Strict Models =====
-class SelectItem(BaseModel):
-    table: str
-    target_type: str
-    target_name: str
-    used_fields: List[str]
-    suggested_fields: List[str]
-    suggested_statement: str
-
-    @field_validator("used_fields", "suggested_fields")
-    @classmethod
-    def no_none_in_list(cls, v: List[str]) -> List[str]:
-        return [x for x in v if x is not None]
+class Finding(BaseModel):
+    pgm_name: Optional[str] = None
+    inc_name: Optional[str] = None
+    type: Optional[str] = None
+    name: Optional[str] = None
+    issue_type: Optional[str] = None
+    severity: Optional[str] = None
+    message: Optional[str] = None
+    suggestion: Optional[str] = None
+    snippet: Optional[str] = None
 
 class Unit(BaseModel):
     pgm_name: str
     inc_name: str
     type: str
-    name: str                # now required
-    code: Optional[str] = "" # we still allow ABAP code to be passed in so we can generate selects
-    selects: List[SelectItem] = Field(default_factory=list)
+    name: Optional[str] = ""
+    start_line: Optional[int] = 0
+    end_line: Optional[int] = 0
+    code: Optional[str] = ""
+    findings: Optional[List[Finding]] = Field(default_factory=list)
 
-# ===== Detection logic =====
 def remediation_comment(field: str) -> str:
-    return f"* TODO: {field.upper()} is obsolete in S/4HANA (SAP Note 2267246). Functionality omitted; remove or redesign."
+    return f"Remove or redesign. {field.upper()} is obsolete in S/4HANA (SAP Note 2267246)."
 
-def parse_and_build_selectitems(code: str) -> List[SelectItem]:
-    findings: List[SelectItem] = []
-
-    # SQL or qualified usage (marc-megru etc.)
-    for m in SQL_FIELD_RE.finditer(code):
-        full = m.group(1)
-        table = full.split("-")[0].split("~")[0].split(">")[0].upper()
-        fld = full.upper()
-        findings.append(
-            SelectItem(
-                table=table,
-                target_type="TABLE",
-                target_name="",
-                used_fields=[fld],
-                suggested_fields=[fld],
-                suggested_statement=f"{full}  {remediation_comment(full)}"
-            )
-        )
-
-    # Declaration usage
-    for m in DECL_FIELD_RE.finditer(code):
+def find_obsolete_usages(code: str, unit: Unit) -> List[Finding]:
+    findings = []
+    for m in SQL_FIELD_RE.finditer(code or ""):
+        field = m.group(1)
+        findings.append(Finding(
+            pgm_name=unit.pgm_name,
+            inc_name=unit.inc_name,
+            type=unit.type,
+            name=unit.name,
+            issue_type="OBSOLETE_FIELD",
+            severity="WARNING",
+            message=f"Obsolete field usage: {field}",
+            suggestion=remediation_comment(field),
+            snippet=field,
+        ))
+    for m in DECL_FIELD_RE.finditer(code or ""):
         data_elem = m.group(3)
-        findings.append(
-            SelectItem(
-                table="",
-                target_type="DATA",
-                target_name="",
-                used_fields=[data_elem.upper()],
-                suggested_fields=[data_elem.upper()],
-                suggested_statement=f"{data_elem}  {remediation_comment(data_elem)}"
-            )
-        )
-
-    # Structure component usage
-    for m in STRUCT_FIELD_RE.finditer(code):
+        findings.append(Finding(
+            pgm_name=unit.pgm_name,
+            inc_name=unit.inc_name,
+            type=unit.type,
+            name=unit.name,
+            issue_type="OBSOLETE_FIELD_DECL",
+            severity="WARNING",
+            message=f"Declaration of obsolete field: {data_elem}",
+            suggestion=remediation_comment(data_elem),
+            snippet=data_elem,
+        ))
+    for m in STRUCT_FIELD_RE.finditer(code or ""):
         compname, data_elem = m.group(1), m.group(2)
-        findings.append(
-            SelectItem(
-                table="",
-                target_type="STRUCT_COMP",
-                target_name=compname,
-                used_fields=[data_elem.upper()],
-                suggested_fields=[data_elem.upper()],
-                suggested_statement=f"{data_elem}  {remediation_comment(data_elem)}"
-            )
-        )
-
+        findings.append(Finding(
+            pgm_name=unit.pgm_name,
+            inc_name=unit.inc_name,
+            type=unit.type,
+            name=unit.name,
+            issue_type="OBSOLETE_STRUCT",
+            severity="WARNING",
+            message=f"Struct field uses obsolete datatype: {data_elem} in {compname}",
+            suggestion=remediation_comment(data_elem),
+            snippet=data_elem,
+        ))
     return findings
 
-# ===== Summariser =====
-def summarize_selects(unit: Unit) -> Dict[str, Any]:
-    field_count: Dict[str, int] = {}
-    flagged = []
-    for s in unit.selects:
-        for f in s.used_fields:
-            field_count[f.upper()] = field_count.get(f.upper(), 0) + 1
-            flagged.append({"field": f, "reason": remediation_comment(f)})
-    return {
-        "program": unit.pgm_name,
-        "include": unit.inc_name,
-        "unit_type": unit.type,
-        "unit_name": unit.name,
-        "stats": {
-            "total_occurrences": len(unit.selects),
-            "fields_frequency": field_count,
-            "note_2267246_flags": flagged
-        }
-    }
-
-# ===== LLM prompt =====
-SYSTEM_MSG = "You are a precise ABAP reviewer familiar with SAP Note 2267246. Output strict JSON only."
-
-USER_TEMPLATE = """
-You are assessing ABAP code usage in light of SAP Note 2267246 (Obsolete MARC/MARD fields in S/4HANA).
-
-We provide program/include/unit metadata and analysis findings (under "selects" with table, used_fields, suggested_fields, and suggested_statement).
-
-Your tasks:
-1) Produce a concise assessment of impact.
-2) Produce an actionable LLM remediation prompt to append TODO comments to obsolete field usages.
-
-Return ONLY strict JSON:
-{{
-  "assessment": "<concise note 2267246 impact>",
-  "llm_prompt": "<prompt for LLM code fixer>"
-}}
-
-Unit metadata:
-- Program: {pgm_name}
-- Include: {inc_name}
-- Unit type: {unit_type}
-- Unit name: {unit_name}
-
-Summary:
-{plan_json}
-
-selects (JSON):
-{selects_json}
+SYSTEM_MSG = """
+You are a senior ABAP expert. Output ONLY JSON as response.
+For every provided payload .findings[].snippet,
+write a bullet point that:
+- Displays the exact offending code (use .snippet)
+- Explains the necessary action to fix it (from .suggestion, if present).
+- Bullet points should contain both offending code snippet and the fix, shown inline.
+- Do NOT omit any snippet; all must be covered, no matter how many there are.
+- Only show actual ABAP code for each snippet with its specific action.
 """.strip()
 
-prompt = ChatPromptTemplate.from_messages(
-    [
-        ("system", SYSTEM_MSG),
-        ("user", USER_TEMPLATE)
-    ]
-)
-llm = ChatOpenAI(model=OPENAI_MODEL)
+USER_TEMPLATE = """
+Unit metadata:
+Program: {pgm_name}
+Include: {inc_name}
+Unit type: {unit_type}
+Unit name: {unit_name}
+Start line: {start_line}
+End line: {end_line}
+
+ABAP code context (optional):
+{code}
+
+findings (JSON list of findings, each with .snippet and .suggestion if present):
+{findings_json}
+
+Instructions:
+1. Write a 1-paragraph assessment summarizing obsolete field risks in human language.
+2. Write a llm_prompt field: for every finding, add a bullet point with
+   - The exact code (snippet field)
+   - The action required (from suggestion field, if any).
+   - Do not compress, omit, or refer to them by index; always display code inline.
+
+Return valid JSON with:
+{{
+  "assessment": "<paragraph>",
+  "llm_prompt": "<action bullets>"
+}}
+""".strip()
+
+prompt = ChatPromptTemplate.from_messages([
+    ("system", SYSTEM_MSG),
+    ("user", USER_TEMPLATE),
+])
+llm = ChatOpenAI(model=OPENAI_MODEL, temperature=0.0)
 parser = JsonOutputParser()
 chain = prompt | llm | parser
 
-def llm_assess_and_prompt(unit: Unit) -> Dict[str, str]:
-    plan = summarize_selects(unit)
-    plan_json = json.dumps(plan, ensure_ascii=False, indent=2)
-    selects_json = json.dumps([s.model_dump() for s in unit.selects], ensure_ascii=False, indent=2)
+def llm_assess_and_prompt_sync(unit: Unit) -> Dict[str, str]:
+    findings_json = json.dumps([f.model_dump() for f in (unit.findings or [])], ensure_ascii=False, indent=2)
     try:
         return chain.invoke({
             "pgm_name": unit.pgm_name,
             "inc_name": unit.inc_name,
             "unit_type": unit.type,
-            "unit_name": unit.name,
-            "plan_json": plan_json,
-            "selects_json": selects_json
+            "unit_name": unit.name or "",
+            "start_line": unit.start_line or 0,
+            "end_line": unit.end_line or 0,
+            "code": unit.code or "",
+            "findings_json": findings_json,
         })
     except Exception as e:
         raise HTTPException(status_code=502, detail=f"LLM call failed: {e}")
 
-# ===== API Endpoint =====
 @app.post("/assess-2267246-strict")
-async def assess_obsolete_fields(units: List[Unit]) -> List[Dict[str, Any]]:
+async def assess_obsolete_snippet(units: List[Unit]) -> List[Dict[str, Any]]:
     out: List[Dict[str, Any]] = []
+    loop = asyncio.get_running_loop()
     for u in units:
-        # Build selects from code if provided
-        if u.code:
-            u.selects = parse_and_build_selectitems(u.code)
-
-        if not u.selects:
-            obj = u.model_dump()
-            obj.pop("selects", None)
-            obj["assessment"] = "No usage of obsolete MARC/MARD fields found (SAP Note 2267246)."
-            obj["llm_prompt"] = ""
-            out.append(obj)
-            continue
-
-        llm_out = llm_assess_and_prompt(u)
+        if not u.findings or len(u.findings) == 0:
+            if u.code:
+                u.findings = find_obsolete_usages(u.code, u)
+        if not u.findings or len(u.findings) == 0:
+            continue  # skip if negative
+            
+        # LLM call in background thread
+        llm_out = await loop.run_in_executor(
+            None, llm_assess_and_prompt_sync, u
+        )
         obj = u.model_dump()
-        obj.pop("selects", None)
-        obj.pop("code", None)  # don't return raw code
         obj["assessment"] = llm_out.get("assessment", "")
-        obj["llm_prompt"] = llm_out.get("llm_prompt", "")
+        prompt_out = llm_out.get("llm_prompt", "")
+        if isinstance(prompt_out, list):
+            prompt_out = "\n".join(str(x) for x in prompt_out if x is not None)
+        obj["llm_prompt"] = prompt_out
+        obj.pop("findings", None)
         out.append(obj)
-
     return out
 
 @app.get("/health")
